@@ -13,7 +13,7 @@ use std::{
     error::Error,
     fmt::{Debug, Display},
     fs,
-    io::{self, BufRead, BufReader, Read, Seek, Write},
+    io::{self, BufReader, Read, Seek, Write},
     mem, path,
 };
 
@@ -410,7 +410,6 @@ mod test {
 
         let item1 = "hello world";
         let item2 = (0..10)
-            .into_iter()
             .flat_map(|v| (v as u32 * v as u32).to_le_bytes())
             .collect::<Vec<_>>();
 

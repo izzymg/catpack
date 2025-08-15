@@ -1,11 +1,3 @@
-[package]
-name = "datpack"
-version = "0.1.0"
-edition = "2024"
-default-run = "main"
-
-[lib]
-name = "libdatpack"
-path = "src/lib.rs"
-
-[dependencies]
+[workspace]
+resolver = "3"
+members=  ["catpack", "catpacker"]

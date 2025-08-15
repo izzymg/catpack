@@ -1,0 +1,10 @@
+[package]
+name = "catpacker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.5.45"
+catpack = { path = "../catpack" }
+log = "0.4.27"
+env_logger = { version = "0.11.8", default-features = false, features = ["auto-color"] }

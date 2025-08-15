@@ -58,7 +58,7 @@ fn flush_chunks(
 ) -> io::Result<usize> {
     let chunk_size = chunks
         .iter()
-        .fold(0, |ac, chunk: &PackageChunk| ac + chunk.data.len());
+        .fold(0, |ac, chunk: &PackageChunk| ac + chunk.raw_bytes.len());
     log::info!(
         "writing chunk to disk: {} files, {chunk_size} bytes",
         chunks.len()
@@ -114,7 +114,7 @@ fn pack(
         };
         log::info!("reading: {file_id} ({i}/{total_to_process})");
         let chunk = match fs::read(&file_path) {
-            Ok(data) => PackageChunk::new(file_id, data),
+            Ok(data) => PackageChunk::new_uncompressed(file_id, data),
             Err(e) => {
                 log::warn!("failed to read: {file_path:?}, skipping: {e}");
                 continue;

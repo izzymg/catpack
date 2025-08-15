@@ -9,20 +9,20 @@ use std::{
     fmt::{Debug, Display},
     fs,
     io::{self, BufReader, Read, Seek, Write},
-    mem, 
+    mem,
 };
 
 /// The size in bytes of the package format's header.
 pub const HEADER_SIZE: usize = 4 + 4 + 4 + 4 + 8;
 
 /// The size of the TOC-metadata
-pub const TOC_START_SIZE: usize = 20;
+pub const TOC_START_SIZE: usize = 12;
 
 const TOC_OFFSET_LOCATION: usize = 16;
 const FILE_VERSION: u32 = 1;
 const MAGIC: &[u8; 4] = b"DPKG";
 const TOC_MAGIC: &[u8; 4] = b"toc!";
-const TOC_ENTRY_MIN_SIZE: usize = 24;
+const TOC_ENTRY_MIN_SIZE: usize = 36;
 
 fn parse_u32(input: &[u8]) -> u32 {
     u32::from_le_bytes(input.try_into().expect("slice should be exactly 4 bytes"))
@@ -41,6 +41,7 @@ pub enum PackageError {
     BadMagic(&'static [u8]),
     WrongSize(usize),
     WrongVersion(u32),
+    BadCompressionType(u32),
     UTF8(u64),
     EOF,
     IO(io::Error),
@@ -67,6 +68,9 @@ impl Display for PackageError {
             }
             Self::EOF => {
                 write!(f, "Encountered unexpected EOF")
+            }
+            Self::BadCompressionType(num) => {
+                write!(f, "Bad compression type {num}")
             }
             Self::IO(err) => write!(f, "io: {err}"),
         }
@@ -154,6 +158,10 @@ pub struct PackageTocEntry {
     pub file_offset: u64,
     /// The amount of data this entry's data section is.
     pub data_size: usize,
+    /// The amount of data when uncompressed
+    pub uncompressed_size: usize,
+    /// What kind of (de)compression to apply when reading the data
+    pub compression_type: CompressionType,
 }
 
 /// A package's table of contents (TOC). Describes what's in the file and how to get there, without holding the data directly.
@@ -161,7 +169,6 @@ pub struct PackageTocEntry {
 pub struct PackageToc {
     /// How many TOC entries are there?
     pub num_entries: u64,
-    pub reserved: u64,
     /// Maps data identifiers to TOC entries
     pub entries: HashMap<String, PackageTocEntry>,
 }
@@ -179,7 +186,6 @@ impl PackageToc {
             return Err(PackageError::BadMagic(TOC_MAGIC));
         }
         let num_entries = parse_u64(&buffer[4..12]);
-        let reserved = parse_u64(&buffer[12..20]);
 
         let mut offset: usize = TOC_START_SIZE;
         let mut entries = HashMap::new();
@@ -199,6 +205,14 @@ impl PackageToc {
             if buffer.len() <= required_size {
                 buffer.resize(required_size, 0);
             }
+            // u32: compression type
+            reader.read_exact(&mut buffer[offset..offset + 4])?;
+            let compression_type = parse_u32(&buffer[offset..offset + 4]);
+            offset += 4;
+            // u64: uncompressed size
+            reader.read_exact(&mut buffer[offset..offset + 8])?;
+            let uncompressed_size = parse_u64(&buffer[offset..offset + 8]);
+            offset += 8;
             reader.read_exact(&mut buffer[offset..offset + 8])?;
             // u64: filename size
             let filename_size = parse_u64(&buffer[offset..offset + 8]);
@@ -227,6 +241,8 @@ impl PackageToc {
                 PackageTocEntry {
                     data_size: data_size as usize,
                     file_offset,
+                    compression_type: compression_type.try_into()?,
+                    uncompressed_size: uncompressed_size as usize,
                 },
             );
 
@@ -235,7 +251,6 @@ impl PackageToc {
 
         Ok(Self {
             num_entries,
-            reserved,
             entries,
         })
     }
@@ -258,13 +273,29 @@ pub struct PackageSeeker {
 }
 
 impl PackageSeeker {
-    /// Reads the data using given TOC entry into `buffer`
-    pub fn get_data(&mut self, entry: &PackageTocEntry, buffer: &mut Vec<u8>) -> io::Result<()> {
+    /// Reads the data using given TOC entry into `buffer`. Does not apply decompression to the buffer.
+    pub fn read_data_raw(
+        &mut self,
+        entry: &PackageTocEntry,
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<()> {
         if buffer.len() < entry.data_size {
             buffer.resize(entry.data_size, 0u8);
         }
         self.handle.seek(io::SeekFrom::Start(entry.file_offset))?;
         self.handle.read_exact(&mut buffer[0..entry.data_size])?;
+
+        Ok(())
+    }
+
+    /// Reads the data using given TOC entry into `buffer`. Applies decompression to the buffer.
+    pub fn read_data(&mut self, entry: &PackageTocEntry, buffer: &mut Vec<u8>) -> io::Result<()> {
+        self.read_data_raw(entry, buffer)?;
+        if let Some(mut result) =
+            decompress_data(buffer, &entry.compression_type, entry.uncompressed_size)
+        {
+            std::mem::swap(buffer, &mut result);
+        }
         Ok(())
     }
 }
@@ -319,7 +350,7 @@ impl PackageHandle {
     /// If `None` is returned, there was no entry for the given identifier in the package's table of contents.
     pub fn read_by_id(&mut self, name: &str, buffer: &mut Vec<u8>) -> Option<io::Result<()>> {
         let entry = self.toc.get_entry(name)?;
-        match self.seeker.get_data(entry, buffer) {
+        match self.seeker.read_data(entry, buffer) {
             Ok(()) => Some(Ok(())),
             Err(e) => Some(Err(e)),
         }
@@ -338,13 +369,94 @@ impl PackageHandle {
 /// A chunk of data to write into the package.
 #[derive(Debug)]
 pub struct PackageChunk {
-    pub data: Vec<u8>,
+    pub raw_bytes: Vec<u8>,
+    /// This chunk's bytes will be passed through the compression algorithm before write.
+    pub compression_type: CompressionType,
     pub id: String,
 }
 
 impl PackageChunk {
-    pub fn new(id: String, data: Vec<u8>) -> Self {
-        Self { id, data }
+    pub fn new(id: String, data: Vec<u8>, apply_compression: CompressionType) -> Self {
+        Self {
+            id,
+            raw_bytes: data,
+            compression_type: apply_compression,
+        }
+    }
+
+    pub fn new_uncompressed(id: String, data: Vec<u8>) -> Self {
+        Self {
+            id,
+            raw_bytes: data,
+            compression_type: CompressionType::None,
+        }
+    }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.raw_bytes
+    }
+}
+
+#[must_use]
+fn compress_data(data: &Vec<u8>, compression_type: &CompressionType) -> Option<Vec<u8>> {
+    match compression_type {
+        CompressionType::None => None,
+        #[cfg(feature = "lz4")]
+        CompressionType::LZ4 => {
+            use lz4_flex;
+            Some(lz4_flex::compress(&data))
+        }
+    }
+}
+
+#[must_use]
+fn decompress_data(
+    data: &Vec<u8>,
+    compression_type: &CompressionType,
+    uncompressed_size: usize,
+) -> Option<Vec<u8>> {
+    match compression_type {
+        CompressionType::None => None,
+        #[cfg(feature = "lz4")]
+        CompressionType::LZ4 => {
+            use lz4_flex;
+            Some(
+                lz4_flex::decompress(&data, uncompressed_size)
+                .expect("decompression failed, package is likely corrupt due to invalid uncompressed size header")
+            )
+        }
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+pub enum CompressionType {
+    #[default]
+    None,
+
+    #[cfg(feature = "lz4")]
+    LZ4 = 1,
+}
+
+impl CompressionType {
+    fn to_le_bytes(&self) -> [u8; 4] {
+        match self {
+            CompressionType::None => 0u32.to_le_bytes(),
+            #[cfg(feature = "lz4")]
+            CompressionType::LZ4 => 1u32.to_le_bytes(),
+        }
+    }
+}
+
+impl TryFrom<u32> for CompressionType {
+    type Error = PackageError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::None),
+            #[cfg(feature = "lz4")]
+            1 => Ok(Self::LZ4),
+            _ => Err(PackageError::BadCompressionType(value)),
+        }
     }
 }
 
@@ -352,7 +464,9 @@ impl PackageChunk {
 struct PackageBuilderEntry {
     id: String,
     data_size: usize,
+    uncompressed_size: usize,
     file_offset: usize,
+    compression: CompressionType,
 }
 
 /// Allows for building and writing out a package.
@@ -403,16 +517,29 @@ impl PackageBuilder {
         writer.seek(io::SeekFrom::End(0))?;
 
         for data in datas.into_iter() {
-            // Store the necessary data for the TOC
+            // Calculate where this piece of data starts in the file
             let file_offset = HEADER_SIZE + self.data_size;
-            self.data_size += data.data.len();
+
+            // Snag the uncompressed size, then try compress it
+            let compression_type = data.compression_type;
+            let id = data.id.clone();
+            let uncompressed_size = data.raw_bytes.len();
+            let raw_bytes = data.into_inner();
+
+            let write_data = compress_data(&raw_bytes, &compression_type).unwrap_or(raw_bytes);
+            self.data_size += write_data.len();
+
+            // Store the data for writing the TOC at the end
             entries.push(PackageBuilderEntry {
-                id: data.id,
+                id,
                 file_offset,
-                data_size: data.data.len(),
+                data_size: write_data.len(),
+                uncompressed_size,
+                compression: compression_type,
             });
+
             // Write file data to the end of the file
-            total_written += writer.write(&data.data)?;
+            total_written += writer.write(&write_data)?;
         }
         self.toc.extend(entries);
         // Write the new position of the offset
@@ -432,9 +559,12 @@ impl PackageBuilder {
         let mut table_of_contents = Vec::new();
         table_of_contents.extend(TOC_MAGIC);
         table_of_contents.extend(&(self.toc.len() as u64).to_le_bytes());
-        table_of_contents.extend(&0u64.to_le_bytes()); // Reserved
 
         for entry in self.toc.iter() {
+            // u32 file compression type
+            table_of_contents.extend(entry.compression.to_le_bytes());
+            // u64 file uncompressed size
+            table_of_contents.extend(entry.uncompressed_size.to_le_bytes());
             // u64 filename length
             let filename_len = entry.id.len();
             table_of_contents.extend(filename_len.to_le_bytes());
@@ -456,8 +586,8 @@ impl PackageBuilder {
 mod test {
     use super::*;
 
-    use std::path::Path;
     use std::fs;
+    use std::path::Path;
     use std::time::Instant;
 
     #[test]
@@ -477,9 +607,9 @@ mod test {
         let item3 = "woah";
 
         let chunks = vec![
-            PackageChunk::new("item1".to_string(), item1.as_bytes().to_vec()),
-            PackageChunk::new("where/item/be/item2".to_string(), item2.to_vec()),
-            PackageChunk::new(
+            PackageChunk::new_uncompressed("item1".to_string(), item1.as_bytes().to_vec()),
+            PackageChunk::new_uncompressed("where/item/be/item2".to_string(), item2.to_vec()),
+            PackageChunk::new_uncompressed(
                 "look_at_this/photo.graph".to_string(),
                 item3.as_bytes().to_vec(),
             ),

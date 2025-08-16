@@ -4,7 +4,7 @@ use std::path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use catpack::{PackageBuilder, PackageChunk, PackageHandle};
+use catpack::{CompressionType, PackageBuilder, PackageChunk, PackageHandle, WriteResult};
 
 use clap::{Arg, Command};
 
@@ -13,6 +13,7 @@ const EXTENSION: &str = "cpkg";
 struct Config {
     quiet: bool,
     chunk_count: usize,
+    compression_type: CompressionType,
 }
 
 fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> io::Result<(Duration, usize)> {
@@ -30,10 +31,6 @@ fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> io::Result<(Durat
 
     for entry in entries.iter() {
         buffer.clear();
-        let needed_size = package.get_data_size(entry).expect("this should exist");
-        if buffer.len() < needed_size {
-            buffer.resize(needed_size, 0u8);
-        }
         package
             .read_by_id(entry, &mut buffer)
             .expect("this also should exist")?;
@@ -45,7 +42,7 @@ fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> io::Result<(Durat
         }
         let mut file = fs::File::create(path)?;
         file.write_all(&buffer)?;
-        bytes_written += needed_size;
+        bytes_written += buffer.len();
     }
 
     Ok((time_t.elapsed(), bytes_written))
@@ -55,7 +52,7 @@ fn flush_chunks(
     package: &mut PackageBuilder,
     output_file: &mut File,
     chunks: Vec<PackageChunk>,
-) -> io::Result<usize> {
+) -> io::Result<WriteResult> {
     let chunk_size = chunks
         .iter()
         .fold(0, |ac, chunk: &PackageChunk| ac + chunk.raw_bytes.len());
@@ -66,29 +63,42 @@ fn flush_chunks(
     package.write_chunks(output_file, chunks)
 }
 
+struct PackResult {
+    time_taken: Duration,
+    bytes_written: usize,
+    compressed_data_size: usize,
+    uncompressed_data_size: usize,
+}
+
 fn pack(
     config: &Config,
     input_dir: &path::Path,
     mut output_path: path::PathBuf,
-) -> io::Result<(Duration, usize)> {
+) -> io::Result<PackResult> {
+    let mut bytes_written = 0;
+    let mut compressed_data_size = 0;
+    let mut uncompressed_data_size = 0;
+
     if output_path.extension().is_none() {
         output_path = output_path.with_extension(EXTENSION);
     }
     let mut output_file = fs::File::create(output_path)?;
     let input_dir_name = input_dir.file_stem().expect("dir must have a valid stem");
-    let mut bytes_written = 0;
-    let time_t = Instant::now();
+    let start_time = Instant::now();
     // For now we'll just support 1 level of depth
     let mut package = PackageBuilder::new();
     bytes_written += package.write_header(&mut output_file)?;
 
-    let files_to_process = input_dir.read_dir()?.filter_map(|file| {
-        let file_path = file.expect("failed to read file in directory").path();
-        if file_path.is_dir() {
-            return None;
-        }
-        Some(file_path)
-    }).collect::<Vec<_>>();
+    let files_to_process = input_dir
+        .read_dir()?
+        .filter_map(|file| {
+            let file_path = file.expect("failed to read file in directory").path();
+            if file_path.is_dir() {
+                return None;
+            }
+            Some(file_path)
+        })
+        .collect::<Vec<_>>();
 
     let total_to_process = files_to_process.len();
 
@@ -96,7 +106,10 @@ fn pack(
     for (i, file_path) in files_to_process.iter().enumerate() {
         if chunks.len() >= config.chunk_count {
             let flush = std::mem::take(&mut chunks);
-            bytes_written += flush_chunks(&mut package, &mut output_file, flush)?;
+            let result = flush_chunks(&mut package, &mut output_file, flush)?;
+            uncompressed_data_size += result.total_uncompressed_size;
+            compressed_data_size += result.total_compressed_size;
+            bytes_written += result.total_compressed_size;
         }
 
         // TODO: this sucks (utf-8 unwraps, push_str)
@@ -114,7 +127,7 @@ fn pack(
         };
         log::info!("reading: {file_id} ({i}/{total_to_process})");
         let chunk = match fs::read(&file_path) {
-            Ok(data) => PackageChunk::new_uncompressed(file_id, data),
+            Ok(data) => PackageChunk::new(file_id, data, config.compression_type),
             Err(e) => {
                 log::warn!("failed to read: {file_path:?}, skipping: {e}");
                 continue;
@@ -122,12 +135,20 @@ fn pack(
         };
         chunks.push(chunk);
     }
-    bytes_written += flush_chunks(&mut package, &mut output_file, chunks)?;
+    let result = flush_chunks(&mut package, &mut output_file, chunks)?;
+    uncompressed_data_size += result.total_uncompressed_size;
+    compressed_data_size += result.total_compressed_size;
+    bytes_written += result.total_compressed_size;
     bytes_written += package.write_toc(&mut output_file)?;
+    let time_taken = start_time.elapsed();
 
-    Ok((time_t.elapsed(), bytes_written))
+    Ok(PackResult {
+        time_taken,
+        bytes_written,
+        uncompressed_data_size,
+        compressed_data_size,
+    })
 }
-
 
 fn main() -> ExitCode {
     let matches = Command::new("packer")
@@ -135,6 +156,7 @@ fn main() -> ExitCode {
         .subcommand_required(true) // Must pick a subcommand
         .arg_required_else_help(true) // Show help if missing args
         .arg(Arg::new("quiet").long("quiet").short('q').help("Disables stdout").action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("compress").long("compress").short('c').help("Uses lz4 de/compression on all files").action(clap::ArgAction::SetTrue))
         .arg(Arg::new("chunk-count")
         .help("Specifies the maximum number of files to load into memory at once when packaging a directory")
             .long("chunk-count")
@@ -181,8 +203,13 @@ fn main() -> ExitCode {
 
     let mut cfg = Config {
         chunk_count: 2,
-        quiet: false
+        quiet: false,
+        compression_type: CompressionType::None,
     };
+
+    if matches.get_flag("compress") {
+        cfg.compression_type = CompressionType::LZ4;
+    }
 
     if matches.get_flag("quiet") {
         cfg.quiet = true;
@@ -201,8 +228,37 @@ fn main() -> ExitCode {
             let output: &std::path::PathBuf = sub_m.get_one("output").unwrap();
 
             match pack(&cfg, input, output.clone()) {
-                Ok((time, written)) => {
-                    log::info!("done, wrote {written} bytes in {}ms", time.as_millis())
+                Ok(result) => {
+                    log::info!(
+                        "done packaging: {output:#?} ({} bytes)",
+                        result.bytes_written
+                    );
+                    if !matches!(cfg.compression_type, CompressionType::None) {
+                        let savings_frac = (result.compressed_data_size as f32
+                            / result.uncompressed_data_size as f32)
+                            * 100.;
+                        let savings_bytes =
+                            result.uncompressed_data_size - result.compressed_data_size;
+                        log::info!(
+                            "\t uncompressed data size: {} bytes",
+                            result.uncompressed_data_size
+                        );
+                        log::info!(
+                            "\t compressed data size: {} bytes",
+                            result.compressed_data_size
+                        );
+                        log::info!(
+                            "\t reduction: {} bytes ({:.2}%)",
+                            savings_bytes,
+                            savings_frac
+                        )
+                    } else {
+                        log::info!(
+                            "\t total data size: {} bytes (no compression)",
+                            result.compressed_data_size
+                        );
+                    }
+                    log::info!("\t took: {:#?}", result.time_taken);
                 }
                 Err(e) => {
                     log::error!("failed to write dir package: {e}");
@@ -215,7 +271,8 @@ fn main() -> ExitCode {
             let output: &std::path::PathBuf = sub_m.get_one("output").unwrap();
             match unpack(input, output) {
                 Ok((time, written)) => {
-                    log::info!("done, wrote {written} bytes in {}ms", time.as_millis())
+                    log::info!("done unpacking to {output:#?}");
+                    log::info!("\twrote {written} bytes in {}ms", time.as_millis())
                 }
                 Err(e) => {
                     log::error!("failed to write dir package: {e}");

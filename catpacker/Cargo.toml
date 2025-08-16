@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 clap = "4.5.45"
-catpack = { path = "../catpack" }
+catpack = { path = "../catpack", features = ["lz4"] }
 log = "0.4.27"
 env_logger = { version = "0.11.8", default-features = false, features = ["auto-color"] }

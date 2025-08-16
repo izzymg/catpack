@@ -285,10 +285,12 @@ impl PackageSeeker {
         self.handle.seek(io::SeekFrom::Start(entry.file_offset))?;
         self.handle.read_exact(&mut buffer[0..entry.data_size])?;
 
+
         Ok(())
     }
 
     /// Reads the data using given TOC entry into `buffer`. Applies decompression to the buffer.
+    /// Resizes the buffer if it's too small for the decompressed data.
     pub fn read_data(&mut self, entry: &PackageTocEntry, buffer: &mut Vec<u8>) -> io::Result<()> {
         self.read_data_raw(entry, buffer)?;
         if let Some(mut result) =
@@ -357,10 +359,19 @@ impl PackageHandle {
     }
 
     /// Returns the size of the data at the given identifier without reading the data.
+    /// This is the size of the data in the package, i.e. with compression applied if applicable.
+    /// To allocate a buffer for reading, you likely want `get_read_size`.
     /// Returns `None` if there is no table of contents entry for the given identifier.
-    pub fn get_data_size(&self, name: &str) -> Option<usize> {
+    pub fn get_compressed_data_size(&self, name: &str) -> Option<usize> {
         let entry = self.toc.get_entry(name)?;
         Some(entry.data_size)
+    }
+
+    /// Returns the known uncompressed/raw size of the data at the given identifier, without reading the data.
+    /// Returns `None` if there is no table of contents entry for the given identifier.
+    pub fn get_read_size(&self, name: &str) -> Option<usize> {
+        let entry = self.toc.get_entry(name)?;
+        Some(entry.uncompressed_size)
     }
 }
 
@@ -404,7 +415,8 @@ fn compress_data(data: &Vec<u8>, compression_type: &CompressionType) -> Option<V
         #[cfg(feature = "lz4")]
         CompressionType::LZ4 => {
             use lz4_flex;
-            Some(lz4_flex::compress(&data))
+            let compressed_data = lz4_flex::block::compress(&data);
+            Some(compressed_data)
         }
     }
 }
@@ -421,7 +433,7 @@ fn decompress_data(
         CompressionType::LZ4 => {
             use lz4_flex;
             Some(
-                lz4_flex::decompress(&data, uncompressed_size)
+                lz4_flex::block::decompress(&data, uncompressed_size )
                 .expect("decompression failed, package is likely corrupt due to invalid uncompressed size header")
             )
         }
@@ -469,6 +481,22 @@ struct PackageBuilderEntry {
     compression: CompressionType,
 }
 
+#[derive(Default)]
+pub struct WriteResult {
+    pub total_compressed_size: usize,
+    pub total_uncompressed_size: usize,
+}
+
+impl std::ops::Add for WriteResult {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            total_compressed_size: self.total_compressed_size + rhs.total_compressed_size,
+            total_uncompressed_size: self.total_uncompressed_size + rhs.total_uncompressed_size,
+        }
+    }
+}
+
 /// Allows for building and writing out a package.
 /// Currently requires the user to hold their entire package in-memory - TODO: buffered/flush writing.
 #[derive(Debug, Default)]
@@ -489,8 +517,7 @@ impl PackageBuilder {
         W: Write,
     {
         let mut written = 0;
-        // magic + flags + version 32 bit integers
-        let mut header: Vec<u8> = Vec::with_capacity(mem::size_of::<u32>() * 3);
+        let mut header = vec![];
         // Magic
         header.extend(MAGIC);
         // File version (u32)
@@ -507,11 +534,16 @@ impl PackageBuilder {
     }
 
     /// Writes the given data entries to the file, keeping track of data for the TOC.
-    pub fn write_chunks<W>(&mut self, writer: &mut W, datas: Vec<PackageChunk>) -> io::Result<usize>
+    pub fn write_chunks<W>(
+        &mut self,
+        writer: &mut W,
+        datas: Vec<PackageChunk>,
+    ) -> io::Result<WriteResult>
     where
         W: Write + Seek,
     {
         let mut total_written: usize = 0;
+        let mut total_uncompressed: usize = 0;
 
         let mut entries = vec![];
         writer.seek(io::SeekFrom::End(0))?;
@@ -524,6 +556,7 @@ impl PackageBuilder {
             let compression_type = data.compression_type;
             let id = data.id.clone();
             let uncompressed_size = data.raw_bytes.len();
+            total_uncompressed += uncompressed_size;
             let raw_bytes = data.into_inner();
 
             let write_data = compress_data(&raw_bytes, &compression_type).unwrap_or(raw_bytes);
@@ -545,8 +578,11 @@ impl PackageBuilder {
         // Write the new position of the offset
         writer.seek(io::SeekFrom::Start(TOC_OFFSET_LOCATION as u64))?;
         let toc_offset = HEADER_SIZE + self.data_size;
-        total_written += writer.write(&toc_offset.to_le_bytes())?;
-        Ok(total_written)
+        writer.write(&toc_offset.to_le_bytes())?;
+        Ok(WriteResult {
+            total_compressed_size: total_written,
+            total_uncompressed_size: total_uncompressed,
+        })
     }
 
     /// Writes the stored TOC to the end of the file.
@@ -621,7 +657,9 @@ mod test {
             .expect("chunks must write");
 
         println!(
-            "wrote chunks ({written:?} bytes) in: {:?}",
+            "wrote chunks ({} bytes) ({} uncompressed) in: {:?}",
+            written.total_compressed_size,
+            written.total_uncompressed_size,
             chunk_t.elapsed()
         );
 
@@ -644,7 +682,9 @@ mod test {
         println!("header: {:?}", pkg.header);
         println!("toc: {:?}", pkg.toc);
 
-        let file_size = pkg.get_data_size("item1").expect("item1 must have size");
+        let file_size = pkg
+            .get_compressed_data_size("item1")
+            .expect("item1 must have size");
         assert_eq!(file_size, "hello world".len());
         let mut buffer = vec![0_u8; file_size];
         pkg.read_by_id("item1", &mut buffer)

@@ -20,7 +20,7 @@ pub const TOC_START_SIZE: usize = 12;
 
 const TOC_OFFSET_LOCATION: usize = 16;
 const FILE_VERSION: u32 = 1;
-const MAGIC: &[u8; 4] = b"DPKG";
+const MAGIC: &[u8; 4] = b"CPKG";
 const TOC_MAGIC: &[u8; 4] = b"toc!";
 const TOC_ENTRY_MIN_SIZE: usize = 36;
 
@@ -628,7 +628,7 @@ mod test {
 
     #[test]
     fn test_write_package() {
-        let mut output_file = fs::File::create("test/out.dpk").unwrap();
+        let mut output_file = fs::File::create("test/out.cpkg").unwrap();
         let total_t = Instant::now();
         let mut package = PackageBuilder::new();
         package
@@ -671,13 +671,13 @@ mod test {
 
     #[test]
     fn test_check_header() {
-        let data = fs::read(Path::new("test/in.dpk")).expect("file must load");
+        let data = fs::read(Path::new("test/in.cpkg")).expect("file must load");
         PackageHeader::read_from_memory(&data).expect("must get header data");
     }
 
     #[test]
     fn test_load_package() {
-        let file = fs::File::open(Path::new("test/in.dpk")).expect("file must open");
+        let file = fs::File::open(Path::new("test/in.cpkg")).expect("file must open");
         let mut pkg = PackageHandle::from_file(file).expect("package must parse");
         println!("header: {:?}", pkg.header);
         println!("toc: {:?}", pkg.toc);

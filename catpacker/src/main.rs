@@ -16,11 +16,11 @@ struct Config {
     compression_type: CompressionType,
 }
 
-fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> io::Result<(Duration, usize)> {
+fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
     let mut bytes_written = 0;
     let time_t = Instant::now();
     let file = fs::File::open(input_pkg)?;
-    let mut package = PackageHandle::from_file(file).expect("pkg did not open");
+    let mut package = PackageHandle::from_file(file)?;
     let entries = package.iter().cloned().collect::<Vec<_>>();
 
     if !output_path.exists() {
@@ -31,14 +31,16 @@ fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> io::Result<(Durat
 
     for entry in entries.iter() {
         buffer.clear();
-        package
-            .read_by_id(entry, &mut buffer)
-            .expect("this also should exist")?;
+        match package.read_by_id(entry, &mut buffer) {
+            Some(Ok(())) => {},
+            Some(Err(e)) => return Err(format!("Failed to read file '{}' from package: {}", entry, e).into()),
+            None => return Err(format!("File '{}' not found in package", entry).into()),
+        }
 
         let path = path::Path::new(output_path).join(entry);
-        let parent = path.parent().unwrap();
+        let parent = path.parent().ok_or_else(|| format!("Invalid path for file '{}'", entry))?;
         if !parent.exists() {
-            fs::create_dir(path.parent().unwrap())?;
+            fs::create_dir_all(parent)?;
         }
         let mut file = fs::File::create(path)?;
         file.write_all(&buffer)?;
@@ -74,7 +76,7 @@ fn pack(
     config: &Config,
     input_dir: &path::Path,
     mut output_path: path::PathBuf,
-) -> io::Result<PackResult> {
+) -> Result<PackResult, Box<dyn std::error::Error>> {
     let mut bytes_written = 0;
     let mut compressed_data_size = 0;
     let mut uncompressed_data_size = 0;
@@ -83,7 +85,7 @@ fn pack(
         output_path = output_path.with_extension(EXTENSION);
     }
     let mut output_file = fs::File::create(output_path)?;
-    let input_dir_name = input_dir.file_stem().expect("dir must have a valid stem");
+    let input_dir_name = input_dir.file_stem().ok_or("Input directory must have a valid name")?;
     let start_time = Instant::now();
     // For now we'll just support 1 level of depth
     let mut package = PackageBuilder::new();
@@ -112,14 +114,14 @@ fn pack(
             bytes_written += result.total_compressed_size;
         }
 
-        // TODO: this sucks (utf-8 unwraps, push_str)
+        // Handle UTF-8 conversion properly
         let file_id = match file_path.file_name() {
             Some(stem) => {
-                let mut str = String::new();
-                str.push_str(input_dir_name.to_str().unwrap());
-                str.push('/');
-                str.push_str(stem.to_str().unwrap());
-                str
+                let dir_name = input_dir_name.to_str()
+                    .ok_or_else(|| format!("Directory name contains invalid UTF-8: {:?}", input_dir_name))?;
+                let file_name = stem.to_str()
+                    .ok_or_else(|| format!("File name contains invalid UTF-8: {:?}", stem))?;
+                format!("{}/{}", dir_name, file_name)
             }
             None => {
                 continue;
@@ -261,7 +263,46 @@ fn main() -> ExitCode {
                     log::info!("\t took: {:#?}", result.time_taken);
                 }
                 Err(e) => {
-                    log::error!("failed to write dir package: {e}");
+                    // Provide user-friendly error messages
+                    if let Some(pkg_err) = e.downcast_ref::<catpack::PackageError>() {
+                        match pkg_err {
+                            catpack::PackageError::BadMagic(_) => {
+                                eprintln!("Error: The input file is not a valid package file or is corrupted.");
+                            }
+                            catpack::PackageError::WrongVersion(version) => {
+                                eprintln!("Error: Package file version {} is not supported by this version of catpacker.", version);
+                            }
+                            catpack::PackageError::BadCompressionType(compression) => {
+                                eprintln!("Error: Unknown compression type {} in package file.", compression);
+                            }
+                            catpack::PackageError::UTF8(_) => {
+                                eprintln!("Error: Package contains invalid UTF-8 file names.");
+                            }
+                            catpack::PackageError::EOF => {
+                                eprintln!("Error: Package file is truncated or corrupted.");
+                            }
+                            _ => {
+                                eprintln!("Error: Package processing failed: {}", pkg_err);
+                            }
+                        }
+                    } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        match io_err.kind() {
+                            std::io::ErrorKind::NotFound => {
+                                eprintln!("Error: Input directory or file not found: {}", input.display());
+                            }
+                            std::io::ErrorKind::PermissionDenied => {
+                                eprintln!("Error: Permission denied accessing input or output location.");
+                            }
+                            std::io::ErrorKind::InvalidInput => {
+                                eprintln!("Error: Invalid input path specified.");
+                            }
+                            _ => {
+                                eprintln!("Error: Failed to pack directory: {}", io_err);
+                            }
+                        }
+                    } else {
+                        eprintln!("Error: Failed to pack directory: {}", e);
+                    }
                     return ExitCode::FAILURE;
                 }
             }
@@ -275,7 +316,46 @@ fn main() -> ExitCode {
                     log::info!("\twrote {written} bytes in {}ms", time.as_millis())
                 }
                 Err(e) => {
-                    log::error!("failed to write dir package: {e}");
+                    // Provide user-friendly error messages for unpacking
+                    if let Some(pkg_err) = e.downcast_ref::<catpack::PackageError>() {
+                        match pkg_err {
+                            catpack::PackageError::BadMagic(_) => {
+                                eprintln!("Error: '{}' is not a valid package file or is corrupted.", input.display());
+                            }
+                            catpack::PackageError::WrongVersion(version) => {
+                                eprintln!("Error: Package file version {} is not supported by this version of catpacker.", version);
+                            }
+                            catpack::PackageError::BadCompressionType(compression) => {
+                                eprintln!("Error: Unknown compression type {} in package file.", compression);
+                            }
+                            catpack::PackageError::UTF8(_) => {
+                                eprintln!("Error: Package contains invalid UTF-8 file names.");
+                            }
+                            catpack::PackageError::EOF => {
+                                eprintln!("Error: Package file '{}' is truncated or corrupted.", input.display());
+                            }
+                            _ => {
+                                eprintln!("Error: Failed to read package '{}': {}", input.display(), pkg_err);
+                            }
+                        }
+                    } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                        match io_err.kind() {
+                            std::io::ErrorKind::NotFound => {
+                                eprintln!("Error: Package file not found: {}", input.display());
+                            }
+                            std::io::ErrorKind::PermissionDenied => {
+                                eprintln!("Error: Permission denied accessing package file or output directory.");
+                            }
+                            std::io::ErrorKind::InvalidInput => {
+                                eprintln!("Error: Invalid package file or output path specified.");
+                            }
+                            _ => {
+                                eprintln!("Error: Failed to unpack package: {}", io_err);
+                            }
+                        }
+                    } else {
+                        eprintln!("Error: Failed to unpack package: {}", e);
+                    }
                     return ExitCode::FAILURE;
                 }
             }

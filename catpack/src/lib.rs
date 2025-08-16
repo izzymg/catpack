@@ -409,13 +409,13 @@ impl PackageChunk {
 }
 
 #[must_use]
-fn compress_data(data: &Vec<u8>, compression_type: &CompressionType) -> Option<Vec<u8>> {
+fn compress_data(data: &[u8], compression_type: &CompressionType) -> Option<Vec<u8>> {
     match compression_type {
         CompressionType::None => None,
         #[cfg(feature = "lz4")]
         CompressionType::LZ4 => {
             use lz4_flex;
-            let compressed_data = lz4_flex::block::compress(&data);
+            let compressed_data = lz4_flex::block::compress(data);
             Some(compressed_data)
         }
     }
@@ -423,7 +423,7 @@ fn compress_data(data: &Vec<u8>, compression_type: &CompressionType) -> Option<V
 
 #[must_use]
 fn decompress_data(
-    data: &Vec<u8>,
+    data: &[u8],
     compression_type: &CompressionType,
     uncompressed_size: usize,
 ) -> Option<Vec<u8>> {
@@ -433,7 +433,7 @@ fn decompress_data(
         CompressionType::LZ4 => {
             use lz4_flex;
             Some(
-                lz4_flex::block::decompress(&data, uncompressed_size )
+                lz4_flex::block::decompress(data, uncompressed_size )
                 .expect("decompression failed, package is likely corrupt due to invalid uncompressed size header")
             )
         }
@@ -450,7 +450,7 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
-    fn to_le_bytes(&self) -> [u8; 4] {
+    fn to_le_bytes(self) -> [u8; 4] {
         match self {
             CompressionType::None => 0u32.to_le_bytes(),
             #[cfg(feature = "lz4")]
@@ -578,7 +578,7 @@ impl PackageBuilder {
         // Write the new position of the offset
         writer.seek(io::SeekFrom::Start(TOC_OFFSET_LOCATION as u64))?;
         let toc_offset = HEADER_SIZE + self.data_size;
-        writer.write(&toc_offset.to_le_bytes())?;
+        writer.write_all(&toc_offset.to_le_bytes())?;
         Ok(WriteResult {
             total_compressed_size: total_written,
             total_uncompressed_size: total_uncompressed,

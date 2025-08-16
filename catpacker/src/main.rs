@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path;
@@ -16,7 +17,7 @@ struct Config {
     compression_type: CompressionType,
 }
 
-fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
+fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> Result<(Duration, usize), Box<dyn Error>> {
     let mut bytes_written = 0;
     let time_t = Instant::now();
     let file = fs::File::open(input_pkg)?;
@@ -33,12 +34,12 @@ fn unpack(input_pkg: &path::Path, output_path: &path::Path) -> Result<(Duration,
         buffer.clear();
         match package.read_by_id(entry, &mut buffer) {
             Some(Ok(())) => {},
-            Some(Err(e)) => return Err(format!("Failed to read file '{}' from package: {}", entry, e).into()),
-            None => return Err(format!("File '{}' not found in package", entry).into()),
+            Some(Err(e)) => return Err(format!("Failed to read file '{entry}' from package: {e}").into()),
+            None => return Err(format!("File '{entry}' not found in package").into()),
         }
 
         let path = path::Path::new(output_path).join(entry);
-        let parent = path.parent().ok_or_else(|| format!("Invalid path for file '{}'", entry))?;
+        let parent = path.parent().ok_or_else(|| format!("Invalid path for file '{entry}'"))?;
         if !parent.exists() {
             fs::create_dir_all(parent)?;
         }
@@ -118,17 +119,17 @@ fn pack(
         let file_id = match file_path.file_name() {
             Some(stem) => {
                 let dir_name = input_dir_name.to_str()
-                    .ok_or_else(|| format!("Directory name contains invalid UTF-8: {:?}", input_dir_name))?;
+                    .ok_or_else(|| format!("Directory name contains invalid UTF-8: {input_dir_name:?}"))?;
                 let file_name = stem.to_str()
-                    .ok_or_else(|| format!("File name contains invalid UTF-8: {:?}", stem))?;
-                format!("{}/{}", dir_name, file_name)
+                    .ok_or_else(|| format!("File name contains invalid UTF-8: {stem:?}"))?;
+                format!("{dir_name}/{file_name}")
             }
             None => {
                 continue;
             }
         };
         log::info!("reading: {file_id} ({i}/{total_to_process})");
-        let chunk = match fs::read(&file_path) {
+        let chunk = match fs::read(file_path) {
             Ok(data) => PackageChunk::new(file_id, data, config.compression_type),
             Err(e) => {
                 log::warn!("failed to read: {file_path:?}, skipping: {e}");
@@ -250,9 +251,7 @@ fn main() -> ExitCode {
                             result.compressed_data_size
                         );
                         log::info!(
-                            "\t reduction: {} bytes ({:.2}%)",
-                            savings_bytes,
-                            savings_frac
+                            "\t reduction: {savings_bytes} bytes ({savings_frac:.2}%)"
                         )
                     } else {
                         log::info!(
@@ -270,10 +269,10 @@ fn main() -> ExitCode {
                                 eprintln!("Error: The input file is not a valid package file or is corrupted.");
                             }
                             catpack::PackageError::WrongVersion(version) => {
-                                eprintln!("Error: Package file version {} is not supported by this version of catpacker.", version);
+                                eprintln!("Error: Package file version {version} is not supported by this version of catpacker.");
                             }
                             catpack::PackageError::BadCompressionType(compression) => {
-                                eprintln!("Error: Unknown compression type {} in package file.", compression);
+                                eprintln!("Error: Unknown compression type {compression} in package file.");
                             }
                             catpack::PackageError::UTF8(_) => {
                                 eprintln!("Error: Package contains invalid UTF-8 file names.");
@@ -282,7 +281,7 @@ fn main() -> ExitCode {
                                 eprintln!("Error: Package file is truncated or corrupted.");
                             }
                             _ => {
-                                eprintln!("Error: Package processing failed: {}", pkg_err);
+                                eprintln!("Error: Package processing failed: {pkg_err}");
                             }
                         }
                     } else if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -297,11 +296,11 @@ fn main() -> ExitCode {
                                 eprintln!("Error: Invalid input path specified.");
                             }
                             _ => {
-                                eprintln!("Error: Failed to pack directory: {}", io_err);
+                                eprintln!("Error: Failed to pack directory: {io_err}");
                             }
                         }
                     } else {
-                        eprintln!("Error: Failed to pack directory: {}", e);
+                        eprintln!("Error: Failed to pack directory: {e}");
                     }
                     return ExitCode::FAILURE;
                 }
@@ -323,10 +322,10 @@ fn main() -> ExitCode {
                                 eprintln!("Error: '{}' is not a valid package file or is corrupted.", input.display());
                             }
                             catpack::PackageError::WrongVersion(version) => {
-                                eprintln!("Error: Package file version {} is not supported by this version of catpacker.", version);
+                                eprintln!("Error: Package file version {version} is not supported by this version of catpacker.");
                             }
                             catpack::PackageError::BadCompressionType(compression) => {
-                                eprintln!("Error: Unknown compression type {} in package file.", compression);
+                                eprintln!("Error: Unknown compression type {compression} in package file.");
                             }
                             catpack::PackageError::UTF8(_) => {
                                 eprintln!("Error: Package contains invalid UTF-8 file names.");
@@ -350,11 +349,11 @@ fn main() -> ExitCode {
                                 eprintln!("Error: Invalid package file or output path specified.");
                             }
                             _ => {
-                                eprintln!("Error: Failed to unpack package: {}", io_err);
+                                eprintln!("Error: Failed to unpack package: {io_err}");
                             }
                         }
                     } else {
-                        eprintln!("Error: Failed to unpack package: {}", e);
+                        eprintln!("Error: Failed to unpack package: {e}");
                     }
                     return ExitCode::FAILURE;
                 }
